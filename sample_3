@@ -1,0 +1,216 @@
+import os
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+
+# Check for TensorFlow
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import Dense, LSTM, Dropout, Input, GlobalAveragePooling1D
+    from tensorflow.keras.optimizers import Adam
+    from tensorflow.keras.callbacks import EarlyStopping
+
+    TF_AVAILABLE = True
+    tf.random.set_seed(42)
+except ImportError:
+    print("WARNING: TensorFlow not found.")
+    TF_AVAILABLE = False
+
+# ================= CONFIGURATION =================
+INPUT_FILE_PATH = r"C:\Users\KAUSHIK G\Downloads\fall_detection 100.xlsx"
+OUTPUT_FILE_PATH = r"C:\Users\KAUSHIK G\OneDrive\Desktop\pd project\Fallall_output.xlsx"
+OUTPUT_DIR = os.path.dirname(OUTPUT_FILE_PATH)
+
+SR = 100
+WINDOW_SEC = 2.0
+STEP_SEC = 1.0
+NUM_EPOCHS = 1000
+BATCH_SIZE = 64
+RANDOM_SEED = 42
+
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
+
+
+# ================= KALMAN ALGORITHM FUNCTIONS =================
+def apply_kalman_filter(signal):
+    """
+    Simple 1D Kalman Filter implementation to smooth sensor noise.
+    """
+    n_iter = len(signal)
+    sz = (n_iter,)
+
+    # Allocate space for arrays
+    xhat = np.zeros(sz)       # a posteri estimate of x
+    P = np.zeros(sz)          # a posteri error estimate
+    xhatminus = np.zeros(sz)  # a priori estimate of x
+    Pminus = np.zeros(sz)     # a priori error estimate
+    K = np.zeros(sz)          # gain or blending factor
+
+    Q = 1e-5      # process variance
+    R = 0.1 ** 2  # estimate of measurement variance
+
+    # Initial guesses
+    xhat[0] = signal[0]
+    P[0] = 1.0
+
+    for k in range(1, n_iter):
+        # Time Update (Predict)
+        xhatminus[k] = xhat[k - 1]
+        Pminus[k] = P[k - 1] + Q
+
+        # Measurement Update (Correct)
+        K[k] = Pminus[k] / (Pminus[k] + R)
+        xhat[k] = xhatminus[k] + K[k] * (signal[k] - xhatminus[k])
+        P[k] = (1 - K[k]) * Pminus[k]
+
+    return xhat
+
+
+def kalman_anomaly_detection(X_data, threshold=2.5):
+    """
+    Detects falls by looking for high variance in the Kalman-smoothed signals.
+    """
+    predictions = []
+    for sample in X_data:
+        # Calculate the magnitude of acceleration (SVM - Signal Vector Magnitude)
+        acc_mag = np.sqrt(np.sum(sample[:, :3] ** 2, axis=1))
+        # If the smoothed acceleration exceeds the threshold, label as Fall
+        if np.max(acc_mag) > threshold:
+            predictions.append(1)
+        else:
+            predictions.append(0)
+    return np.array(predictions)
+
+
+# ================= DATA PROCESSING =================
+def load_and_clean_data(path):
+    df = pd.read_excel(path, engine='openpyxl')
+    df.columns = df.columns.str.strip().str.lower()
+    required_cols = ['acc_x', 'acc_y', 'acc_z', 'gyro_x', 'gyro_y', 'gyro_z', 'heart_rate', 'fall_event']
+    df.dropna(subset=required_cols, inplace=True)
+
+    # --- APPLY KALMAN FILTER TO ALL SENSOR COLUMNS ---
+    print("Applying Kalman Filtering to signals...")
+    sensor_cols = ['acc_x', 'acc_y', 'acc_z', 'gyro_x', 'gyro_y', 'gyro_z']
+    for col in sensor_cols:
+        df[col] = apply_kalman_filter(df[col].values)
+
+    return df
+
+
+def preprocess_and_segment(df):
+    feature_cols = ['acc_x', 'acc_y', 'acc_z', 'gyro_x', 'gyro_y', 'gyro_z', 'heart_rate']
+    window_steps = int(WINDOW_SEC * SR)
+    step_size = int(STEP_SEC * SR)
+    X, y = [], []
+    for i in range(0, len(df) - window_steps, step_size):
+        window = df.iloc[i: i + window_steps]
+        X.append(window[feature_cols].values)
+        y.append(1 if window['fall_event'].max() == 1 else 0)
+    return np.array(X), np.array(y)
+
+
+def build_lstm_model(input_shape):
+    model = Sequential([
+        Input(shape=input_shape),
+        LSTM(32, return_sequences=True),
+        GlobalAveragePooling1D(),
+        Dropout(0.5),
+        Dense(16, activation='relu'),
+        Dense(1, activation='sigmoid')
+    ])
+    model.compile(
+        optimizer=Adam(learning_rate=0.0005),
+        loss='binary_crossentropy',
+        metrics=['accuracy']
+    )
+    return model
+
+
+# ================= MAIN =================
+def main():
+    # 1. Load, Clean, and Kalman Filter
+    df = load_and_clean_data(INPUT_FILE_PATH)
+
+    # 2. Segment
+    X, y = preprocess_and_segment(df)
+
+    # 3. Split
+    X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+        X, y,
+        test_size=0.3,
+        stratify=y if len(np.unique(y)) > 1 else None,
+        random_state=RANDOM_SEED
+    )
+
+    # 4. Scale
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train_raw.reshape(-1, X_train_raw.shape[-1])).reshape(X_train_raw.shape)
+    X_test = scaler.transform(X_test_raw.reshape(-1, X_test_raw.shape[-1])).reshape(X_test_raw.shape)
+
+    results = []
+
+    # --- MODEL 1: LSTM (Deep Learning) ---
+    y_pred_lstm = None
+    if TF_AVAILABLE:
+        print("Training LSTM Model...")
+        lstm_model = build_lstm_model((X_train.shape[1], X_train.shape[2]))
+        early_stop = EarlyStopping(monitor='val_loss', patience=7, restore_best_weights=True)
+
+        history = lstm_model.fit(
+            X_train, y_train,
+            epochs=NUM_EPOCHS,
+            batch_size=BATCH_SIZE,
+            validation_split=0.2,
+            callbacks=[early_stop],
+            verbose=1
+        )
+
+        y_pred_prob = lstm_model.predict(X_test)
+        y_pred_lstm = (y_pred_prob > 0.5).astype(int).flatten()
+        acc = accuracy_score(y_test, y_pred_lstm)
+        _, _, f1, _ = precision_recall_fscore_support(y_test, y_pred_lstm, average='binary', zero_division=0)
+        results.append({'Model': 'LSTM', 'Accuracy': acc, 'F1_Score': f1})
+
+        # Plot training history
+        plt.figure(figsize=(10, 5))
+        plt.plot(history.history['loss'], label='Train Loss')
+        plt.plot(history.history['val_loss'], label='Val Loss')
+        plt.title('LSTM Training vs Validation Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    # --- MODEL 2: KALMAN ANOMALY DETECTOR ---
+    print("Running Kalman Anomaly Algorithm...")
+    y_pred_kalman = kalman_anomaly_detection(X_test)
+
+    acc_k = accuracy_score(y_test, y_pred_kalman)
+    _, _, f1_k, _ = precision_recall_fscore_support(y_test, y_pred_kalman, average='binary', zero_division=0)
+    results.append({'Model': 'Kalman Algorithm', 'Accuracy': acc_k, 'F1_Score': f1_k})
+
+    # --- SAVE RESULTS ---
+    results_df = pd.DataFrame(results)
+    preds_df = pd.DataFrame({'True_Label': y_test, 'Kalman_Pred': y_pred_kalman})
+    if y_pred_lstm is not None:
+        preds_df['LSTM_Pred'] = y_pred_lstm
+
+    with pd.ExcelWriter(OUTPUT_FILE_PATH, engine='openpyxl') as writer:
+        results_df.to_excel(writer, sheet_name='Metrics', index=False)
+        preds_df.to_excel(writer, sheet_name='Predictions', index=False)
+
+    print(f"\nSuccess! Results saved to {OUTPUT_FILE_PATH}")
+    print("\n--- Final Model Metrics ---")
+    print(results_df.to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
