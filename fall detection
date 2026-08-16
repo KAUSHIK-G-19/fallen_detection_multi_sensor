@@ -1,0 +1,507 @@
+import os, sys, math, argparse, random, time
+import numpy as np, pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score, confusion_matrix
+import pickle # Moved pickle import here for consistency
+
+try:
+    import tensorflow as tf
+    TF_AVAILABLE=True
+except Exception:
+    TF_AVAILABLE=False
+
+# Define SR (Sampling Rate) here
+SR = 100 # Assuming a sampling rate of 100 Hz as a common value for IMU data
+
+MAX_EVENTS = 600
+RANDOM_SEED = 0
+np.random.seed(RANDOM_SEED); random.seed(RANDOM_SEED)
+
+REALISM = {
+    'imu_axis_noise_std_g': 0.05,        # per-axis accel noise (g)
+    'imu_bias_drift_std': 0.02,          # low freq drift amplitude (g)
+    'imu_impact_jitter_scale': 0.08,     # randomness on impact amplitude
+    'ir_env_noise_std': 0.04,            # IR measurement noise
+    'ir_dropout_prob': 0.05,             # per-sample sensor dropout
+    'vision_frame_delay_ms': (200, 600), # vision delay range in ms (tuple)
+    'vision_false_pos_rate': 0.03,       # fraction frames with false detection
+    'vision_occlusion_prob': 0.18,       # per-event occlusion probability
+    'timing_jitter_ms': 30,              # jitter between sensors (ms)
+    'person_height_m': 1.7,              # used to map IR proximity heuristics
+}
+
+# Kalman grid (coarse)
+ACC_CANDS = [2.0*9.81, 2.3*9.81, 2.5*9.81]
+R_CANDS = [0.01, 0.02, 0.05]
+
+# Output directories
+OUT_DIR = "fallall_realistic_outputs"
+EVENTS_DIR = os.path.join(OUT_DIR, "events")
+os.makedirs(EVENTS_DIR, exist_ok=True)
+
+# ---------- Utilities ----------
+def compute_a_mag_from_array(arr):
+    a = np.array(arr).astype(float)
+    if a.ndim==2 and a.shape[1] >= 3:
+        return np.linalg.norm(a[:,:3], axis=1)
+    else:
+        return np.abs(a.flatten())
+
+def ensure_timestamped(X, sr=SR):
+    # return timestamps array for length of sequence
+    L = X.shape[0]
+    return np.arange(L) / sr
+
+# ---------- Realistic sensor simulators ----------
+def synth_imu_from_mag(a_mag, sr=SR, params=REALISM):
+    """
+    Given a baseline resultant acceleration magnitude time-series (a_mag),
+    produce a 3-axis IMU realistic time-series (ax,ay,az) with orientation drift, noise.
+    Returns: ax, ay, az arrays and timestamps (same length)
+    Strategy:
+      - Create a base axis-split by assuming gravity mostly on z.
+      - Add small random orientation rotation pattern over time.
+      - Add per-axis gaussian noise and low-frequency bias drift.
+    """
+    n = len(a_mag)
+    t = np.arange(n) / sr
+    # baseline: put gravity on z, subtract G from a_mag to estimate dynamic acceleration
+    G = 9.81
+    dyn = np.maximum(0.0, a_mag - G)  # dynamic positive part
+    # choose random orientation unit vector near z
+    tilt = (np.random.randn() * 0.1)  # small tilt
+    # produce axis contributions (simple model)
+    ax = 0.2 * dyn * np.sin(2*np.pi*0.5*t)  # small harmonic cross-axis
+    ay = 0.2 * dyn * np.cos(2*np.pi*0.3*t)
+    az = dyn - (ax+ay) + G
+    # add noise
+    axis_noise = params['imu_axis_noise_std_g'] * 9.81
+    ax += np.random.normal(0, axis_noise, size=n)
+    ay += np.random.normal(0, axis_noise, size=n)
+    az += np.random.normal(0, axis_noise, size=n)
+    # add slow drift (low-freq)
+    drift_amp = params['imu_bias_drift_std'] * 9.81
+    drift = drift_amp * np.sin(2*np.pi*0.01*t + np.random.rand()*2*np.pi)
+    ax += drift * 0.4; ay += drift * 0.3; az += drift * 0.3
+    # impact jitter: small randomness on high peaks
+    peak_idxs = np.where(a_mag > (2.0*G))[0]
+    for pk in peak_idxs:
+        jitter = 1.0 + params['imu_impact_jitter_scale'] * np.random.randn()
+        # apply to a small window
+        w = slice(max(0, pk-1), min(n, pk+2))
+        ax[w] *= (1.0 + 0.02*np.random.randn())
+        ay[w] *= (1.0 + 0.02*np.random.randn())
+        az[w] *= jitter
+    return np.vstack([ax, ay, az]).T, t
+
+def synth_ir_from_hip_motion(a_mag, orientation_label, sr=SR, params=REALISM):
+    """
+    orientation_label: 'forward', 'back', 'left', 'right', or 'all'
+    Produce 4 IR proximity signals (front/back/left/right) scaled 0..1
+    - During fall event we reduce distances to belt sensors depending on fall direction.
+    - Add environmental noise, occlusion, dropout.
+    """
+    n = len(a_mag)
+    # baseline distance ~1.0 (far) (we model proximity as fractional inverse)
+    base = 1.0 - 0.05 * np.sin(np.linspace(0, 2*np.pi, n))  # small breathing
+    ir = np.tile(base.reshape(-1,1), (1,4))
+    # If event has peak, find peak index
+    G = 9.81
+    peak_idx = np.argmax(a_mag) if np.max(a_mag) > 1.2*G else None
+    if peak_idx is not None and np.max(a_mag) > 1.6*G:
+        # depending on orientation, drop the relevant IRs
+        window = slice(max(0, peak_idx-1), min(n, peak_idx + int(1.5*sr)))
+        if orientation_label in ('forward','all'):
+            ir[window,0] = np.clip(np.random.normal(0.25, params['ir_env_noise_std'], size=(window.stop-window.start)), 0.05, 1.0)
+        if orientation_label in ('back','all'):
+            ir[window,1] = np.clip(np.random.normal(0.25, params['ir_env_noise_std'], size=(window.stop-window.start)), 0.05, 1.0)
+        if orientation_label in ('left','all'):
+            ir[window,2] = np.clip(np.random.normal(0.25, params['ir_env_noise_std'], size=(window.stop-window.start)), 0.05, 1.0)
+        if orientation_label in ('right','all'):
+            ir[window,3] = np.clip(np.random.normal(0.25, params['ir_env_noise_std'], size=(window.stop-window.start)), 0.05, 1.0)
+    # add sensor noise and dropout
+    ir += np.random.normal(0, params['ir_env_noise_std'], size=ir.shape)
+    dropout_mask = np.random.rand(n,4) < params['ir_dropout_prob']
+    ir[dropout_mask] = np.nan
+    # clip
+    ir = np.clip(ir, 0.0, 1.0)
+    return ir
+
+def synth_vision_from_event(a_mag, sr=SR, params=REALISM):
+    """
+    Produce a vision 'upright probability' per frame with delays and occlusion.
+    - We simulate a frame delay (samples) by shifting signal relative to IMU.
+    - Vision prob ~ 0.9 during fall window (indicates fallen), else low.
+    - Add false positives and occlusions.
+    """
+    n = len(a_mag)
+    G = 9.81
+    # baseline low upright-prob ~ 0.15
+    vis = np.clip(np.random.normal(0.15, 0.05, size=n), 0.0, 1.0)
+    peak_idx = np.argmax(a_mag) if np.max(a_mag) > 1.6*G else None
+    if peak_idx is not None:
+        # select a random delay between vision delay range (in samples)
+        delay_ms = np.random.uniform(params['vision_frame_delay_ms'][0], params['vision_frame_delay_ms'][1])
+        delay_s = delay_ms / 1000.0
+        delay_samples = int(np.round(delay_s * sr))
+        start = max(0, peak_idx + delay_samples)
+        end = min(n, start + int(1.8*sr))
+        vis[start:end] = np.clip(np.random.normal(0.85, 0.12, size=(end-start)), 0.0, 1.0)
+    # occlusion
+    if np.random.rand() < params['vision_occlusion_prob']:
+        s = np.random.randint(0, max(1, n//2)); L = np.random.randint(5, max(6, n//4))
+        vis[s:s+L] = np.nan
+    # false positives: random short spikes
+    if np.random.rand() < params['vision_false_pos_rate']:
+        for _ in range(np.random.randint(1,3)):
+            j = np.random.randint(0,n)
+            vis[j: min(n, j+3)] = np.clip(vis[j:min(n,j+3)] + 0.5, 0, 1)
+    return vis
+
+# ---------- Fusion algorithms ----------
+class SimpleKF:
+    def __init__(self, dt=1.0/SR, Q_scale=1.0):
+        self.dt=dt
+        self.A=np.array([[1,dt],[0,1]])
+        self.B=np.array([[0.5*(dt**2)],[dt]])
+        self.Q=np.array([[0.01,0.0],[0.0,0.5]])*Q_scale
+        self.H=np.array([[1.0,0.0]])
+    def reset(self):
+        self.x=np.array([[1.0],[0.0]])
+        self.P=np.eye(2)*0.5
+    def step(self, acc_u, z, R):
+        self.x = self.A.dot(self.x) + self.B * acc_u
+        self.P = self.A.dot(self.P).dot(self.A.T) + self.Q
+        S = float(self.H.dot(self.P).dot(self.H.T) + R)
+        K = self.P.dot(self.H.T)/S
+        y = np.array([[z]]) - self.H.dot(self.x)
+        self.x = self.x + K.dot(y)
+        self.P = (np.eye(2)-K.dot(self.H)).dot(self.P)
+        return float(self.x[0,0])
+
+# rule based detector
+def rule_detect_array(X, acc_thresh, ir_thresh=0.5, vision_thresh=0.5):
+    a = X[:,0]; ir = X[:,1:5]; vis = X[:,5]
+    if not np.any(a >= acc_thresh):
+        return 0, None
+    idx = int(np.argmax(a))
+    # IR majority in next 1.5s
+    win = ir[idx: min(len(a), idx+int(1.5*SR)), :]
+    if win.size==0:
+        ir_major=False
+    else:
+        close_counts = (win < ir_thresh).sum(axis=1)
+        ir_major = np.median(close_counts) >= 2
+    vision_confirm = np.nanmax(vis) >= vision_thresh
+    return (1 if (ir_major or vision_confirm) else 0), idx/SR
+
+def kalman_detect_array(X, acc_thresh, R_meas):
+    a = X[:,0]; ir = X[:,1:5]; vis = X[:,5]
+    kf = SimpleKF(); kf.reset()
+    pos_est=[]
+    for i in range(len(a)):
+        ir_med = np.nanmedian(ir[i,:]) if np.any(~np.isnan(ir[i,:])) else 1.0
+        # If vision is available and indicates upright, use it. Otherwise, rely on IR.
+        # This part of the logic was a bit inverted in the original. Vision prob is high when upright.
+        # So we want to detect falls when vision prob is low (indicating fallen)
+        if not np.isnan(vis[i]) and vis[i] < 0.5: # if vision indicates "not upright"
+            # Lower position estimate when vision confirms fall-like state
+            z = 0.2*(1-vis[i]) + 0.2; R = 0.05 # Smaller R implies more trust in vision
+        else: # vision is NaN or indicates upright, rely on IR
+            z = ir_med; R = R_meas
+        pos = kf.step(acc_u=-(a[i]-9.81), z=z, R=R)
+        pos_est.append(pos)
+    impact = np.any(a >= acc_thresh)
+    prox = np.min(pos_est) < 0.5 # if estimated position gets low
+    return (1 if (impact and prox) else 0), None
+
+# complementary filter: simple weighted running fusion
+def complementary_detect_array(X, acc_thresh, alpha=0.7, ir_thresh=0.5, vision_thresh=0.5):
+    a = X[:,0]; ir = X[:,1:5]; vis = X[:,5]
+    # detect impact
+    if not np.any(a >= acc_thresh):
+        return 0, None
+    idx = int(np.argmax(a))
+    ir_med = np.nanmedian(ir[idx,:]) if np.any(~np.isnan(ir[idx,:])) else 1.0
+    vis_val = np.nanmax(vis) # take max over event window
+    # Fused value: higher when IR is low (close) or Vision is low (not upright)
+    fused = alpha*(1.0 - ir_med) + (1-alpha)*(1.0 - vis_val)
+    return (1 if fused > (1.0 - ir_thresh) else 0), idx/SR
+
+# ---------- Feature extraction ----------
+def extract_features_from_X(X):
+    a = X[:,0]; ir = X[:,1:5]; vis = X[:,5]
+    feats=[]
+    feats += [np.mean(a), np.std(a), np.max(a), np.percentile(a,90)]
+    for i in range(4):
+        col = ir[:,i]
+        feats += [np.nanmean(col), np.nanstd(col), np.nanmin(col)]
+    feats += [np.nanmax(vis), np.nanmean(vis), np.sum(np.isnan(vis))]
+    return np.array(feats)
+
+# ---------- Main experiment pipeline ----------
+def run_pipeline(data_path, mode='quick'):
+    print("Loading dataset:", data_path)
+    with open(data_path, 'rb') as f:
+        data = pickle.load(f)
+
+    # support DataFrame or dict
+    if isinstance(data, dict) and 'X' in data and 'y' in data:
+        Xlist = data['X']; ylist = data['y']
+        df = pd.DataFrame({'Acc': list(Xlist), 'label': list(ylist), 'ActivityID': range(len(Xlist)), 'SubjectID': 0})
+    elif isinstance(data, pd.DataFrame):
+        df = data.copy()
+    else:
+        raise RuntimeError("Unsupported data format. Please supply DataFrame or dict with X,y.")
+
+    # infer fall labels heuristically
+    df['max_acc_mag'] = df['Acc'].apply(lambda x: float(np.max(compute_a_mag_from_array(x))) if len(x)>0 else 0)
+    group_med = df.groupby('ActivityID')['max_acc_mag'].median().reset_index().rename(columns={'max_acc_mag':'median_max'})
+    median_all = group_med['median_max'].median(); std_all = group_med['median_max'].std()
+    threshold = median_all + 0.8*(0 if math.isnan(std_all) else std_all)
+    fall_ids = group_med[group_med['median_max'] >= threshold]['ActivityID'].tolist()
+    if len(fall_ids)==0:
+        fall_ids = group_med.sort_values('median_max', ascending=False).head(5)['ActivityID'].tolist()
+    print("Heuristic fall ActivityIDs:", fall_ids[:10])
+
+    # build events list
+    events=[]
+    for _,row in df.iterrows():
+        a = compute_a_mag_from_array(row['Acc'])
+        label = 1 if row['ActivityID'] in fall_ids else 0
+        events.append({'a_mag': a, 'label':label, 'activity':int(row['ActivityID']), 'subject': int(row.get('SubjectID',-1))})
+
+    # sample balanced
+    falls = [e for e in events if e['label']==1]; nonfalls = [e for e in events if e['label']==0]
+    if mode=='quick':
+        n_each = min(40, len(falls), len(nonfalls))
+    else:
+        n_each = min(MAX_EVENTS//2, len(falls), len(nonfalls))
+    selected = random.sample(falls, n_each) + random.sample(nonfalls, n_each)
+    random.shuffle(selected)
+    print("Selected events:", len(selected), "falls:", sum(e['label'] for e in selected))
+
+    # augment and collect arrays
+    manifest=[]
+    all_X=[]; all_feats=[]; all_labels=[]
+    for i, ev in enumerate(tqdm(selected, desc="Augmenting events")):
+        a = ev['a_mag']; label = ev['label']
+        # choose orientation label (simulate different fall types)
+        orientation = random.choice(['forward','back','left','right','all'])
+        imu_xyz, t = synth_imu_from_mag(a)
+        ir = synth_ir_from_hip_motion(a, orientation)
+        vision = synth_vision_from_event(a)
+        # build unified per-sample array: a_mag, ir4, vision, vis_occl_flag
+        vis_occl = np.isnan(vision).astype(float)
+        # ensure same length and timestamp alignment; if vision delayed, we already inserted delay in generation
+        X = np.vstack([a, ir.T, np.nan_to_num(vision, nan=0.0), vis_occl]).T
+        # save event CSV
+        evtdf = pd.DataFrame({
+            'timestamp': np.arange(len(a))/SR,
+            'a_mag': a,
+            'ax': imu_xyz[:,0], 'ay': imu_xyz[:,1], 'az': imu_xyz[:,2],
+            'ir_f': ir[:,0], 'ir_b': ir[:,1], 'ir_l': ir[:,2], 'ir_r': ir[:,3],
+            'vision_prob': vision,
+            'vis_occl': vis_occl,
+            'label': label
+        })
+        fname = os.path.join(EVENTS_DIR, f'event_{i:04d}.csv')
+        evtdf.to_csv(fname, index=False)
+        manifest.append({'event_id':i, 'filename':fname, 'label':label, 'orientation':orientation})
+        # preprocess X: interpolate IR NaNs
+        for c in range(4):
+            col = X[:,1+c]; nans = np.isnan(col)
+            if np.any(nans):
+                idxs = np.arange(len(col))
+                valid = ~nans
+                if valid.sum() == 0:
+                    col[:] = 1.0
+                else:
+                    col[nans] = np.interp(idxs[nans], idxs[valid], col[valid])
+                X[:,1+c] = col
+        all_X.append(X); all_feats.append(extract_features_from_X(X)); all_labels.append(label)
+    manifest_df = pd.DataFrame(manifest); manifest_df.to_csv(os.path.join(OUT_DIR,'manifest.csv'), index=False)
+    all_feats = np.array(all_feats); all_labels = np.array(all_labels)
+    print("Prepared features:", all_feats.shape)
+
+    # train/test split (stratified)
+    idx = np.arange(len(all_feats))
+    idx_train, idx_temp = train_test_split(idx, test_size=0.4, stratify=all_labels, random_state=RANDOM_SEED)
+    idx_val, idx_test = train_test_split(idx_temp, test_size=0.5, stratify=all_labels[idx_temp], random_state=RANDOM_SEED+1)
+
+    # RandomForest baseline
+    rf = RandomForestClassifier(n_estimators=300, random_state=RANDOM_SEED, n_jobs=-1)
+    rf.fit(all_feats[idx_train], all_labels[idx_train])
+    y_rf = rf.predict(all_feats[idx_test])
+    m_rf = metrics(all_labels[idx_test], y_rf)
+    print("RF test:", m_rf)
+
+    # Kalman tuning (fast grid on val sample)
+    val_sample = list(idx_val)
+    if len(val_sample) > 80:
+        val_sample = random.sample(val_sample, 80)
+    best={'f1': -1}
+    for at in ACC_CANDS:
+        for Rm in R_CANDS:
+            preds=[]
+            for i in val_sample:
+                X = all_X[i]
+                p, _ = kalman_detect_array(X, at, Rm)
+                preds.append(p)
+            _,_,f1,_ = precision_recall_fscore_support(all_labels[val_sample], preds, average='binary', zero_division=0)
+            if f1 > best['f1']:
+                best={'acc_thresh': at, 'R': Rm, 'f1': f1}
+    print("Best Kalman params:", best)
+
+    # Evaluate detectors on test set
+    pred_rule = []; pred_kf=[]; pred_comp=[]
+    for i in idx_test:
+        X = all_X[i]
+        r,_ = rule_detect_array(X, best['acc_thresh'])
+        k,_ = kalman_detect_array(X, best['acc_thresh'], best['R'])
+        c,_ = complementary_detect_array(X, best['acc_thresh'])
+        pred_rule.append(r); pred_kf.append(k); pred_comp.append(c)
+    m_rule = metrics(all_labels[idx_test], pred_rule)
+    m_kf = metrics(all_labels[idx_test], pred_kf)
+    m_comp = metrics(all_labels[idx_test], pred_comp)
+
+    # collate results
+    combined = pd.DataFrame([
+        {'model':'Rule', **m_rule},
+        {'model':'Kalman', **m_kf},
+        {'model':'Complementary', **m_comp},
+        {'model':'RF', **m_rf}
+    ])
+    combined.to_csv(os.path.join(OUT_DIR,'combined_results_realistic.csv'), index=False)
+
+    # save tuning info
+    import json
+    with open(os.path.join(OUT_DIR,'kalman_best.json'),'w') as f:
+        json.dump(best, f, indent=2)
+
+    # plots
+    plot_model_comparison(combined, OUT_DIR)
+    plot_kalman_tuning(val_sample, all_X, all_labels, best['acc_thresh'], R_CANDS, OUT_DIR)
+    plot_latency_cdf(all_X, all_labels, best['acc_thresh'], best['R'], OUT_DIR)  # pass best['R']
+    print("All outputs saved to", OUT_DIR)
+    return combined
+
+# ---------- Helpers: metrics plotting ----------
+def metrics(ytrue, ypred):
+    acc = round(accuracy_score(ytrue, ypred)*100,2)
+    p,r,f1,_ = precision_recall_fscore_support(ytrue, ypred, average='binary', zero_division=0)
+    return {'accuracy':acc, 'precision':round(p*100,2), 'recall':round(r*100,2), 'f1':round(f1*100,2)}
+
+def plot_model_comparison(df, outdir):
+    metrics_list=['accuracy','precision','recall','f1']
+    vals = [[df.loc[i,met] for met in metrics_list] for i in range(len(df))]
+    x = np.arange(len(metrics_list)); width=0.18
+    plt.figure(figsize=(9,4))
+    for i,v in enumerate(vals):
+        plt.bar(x + (i-1.5)*width, v, width, label=df.loc[i,'model'])
+    plt.xticks(x, metrics_list); plt.ylim(0,100); plt.title('Model comparison (realistic)'); plt.legend(); plt.grid(axis='y', linestyle='--', alpha=0.6)
+    plt.tight_layout(); plt.savefig(os.path.join(outdir,'model_comparison_realistic.png'), dpi=150); plt.close()
+
+def plot_kalman_tuning(val_sample, all_X, all_labels, acc_thresh, R_cands, outdir):
+    f1s=[]
+    for Rm in R_cands:
+        preds=[kalman_detect_array(all_X[i], acc_thresh, Rm)[0] for i in val_sample]
+        _,_,f1,_ = precision_recall_fscore_support(all_labels[val_sample], preds, average='binary', zero_division=0)
+        f1s.append(f1*100)
+    plt.figure(figsize=(6,3)); plt.plot([str(r) for r in R_cands], f1s, marker='o'); plt.title('Kalman R tuning (val)'); plt.xlabel('R_meas'); plt.ylabel('F1 (%)'); plt.grid(True); plt.tight_layout(); plt.savefig(os.path.join(outdir,'kalman_tuning_realistic.png'), dpi=150); plt.close()
+
+def plot_latency_cdf(all_X, all_labels, acc_thresh, bestR, outdir): # added bestR
+    # latency: detector detection time - peak time for true falls
+    latencies = {'Rule':[], 'Kalman':[], 'Complementary':[]}
+    for X, y in zip(all_X, all_labels):
+        if y==0: continue
+        a = X[:,0]; peak = np.argmax(a)
+        # rule detection time
+        r_time = find_detection_time_rule(X, acc_thresh)
+        k_time = find_detection_time_kalman(X, acc_thresh, bestR=bestR)  # use the tuned bestR
+        c_time = find_detection_time_complementary(X, acc_thresh)
+        if r_time is not None: latencies['Rule'].append(r_time - peak)
+        if k_time is not None: latencies['Kalman'].append(k_time - peak)
+        if c_time is not None: latencies['Complementary'].append(c_time - peak)
+    plt.figure(figsize=(6,4))
+    for k,v in latencies.items():
+        if len(v)==0: continue
+        data = np.array(v)/SR  # convert to seconds
+        data = np.sort(data); p = np.linspace(0,1,len(data))
+        plt.step(data, p, where='post', label=k)
+    plt.xlabel('detection latency (s) relative to IMU peak'); plt.ylabel('CDF'); plt.legend(); plt.grid(True); plt.tight_layout(); plt.savefig(os.path.join(outdir,'latency_cdf.png'), dpi=150); plt.close()
+
+# helper finders (simple)
+def find_detection_time_rule(X, acc_thresh):
+    a = X[:,0];
+    if not np.any(a>=acc_thresh): return None
+    idx = int(np.argmax(a)) # The rule detection is often tied to the impact
+    # Further logic for IR/Vision confirmation needs to be added here if you want a true "detection time"
+    # For now, it returns the time of the acceleration peak if impact condition met.
+    ir = X[:,1:5]; vis = X[:,5]
+    ir_thresh=0.5; vision_thresh=0.5
+    win = ir[idx: min(len(a), idx+int(1.5*SR)), :]
+    if win.size==0:
+        ir_major=False
+    else:
+        close_counts = (win < ir_thresh).sum(axis=1)
+        ir_major = np.median(close_counts) >= 2
+    vision_confirm = np.nanmax(vis) >= vision_thresh
+    if (ir_major or vision_confirm):
+        return idx
+    return None
+
+def find_detection_time_kalman(X, acc_thresh, bestR=0.02):
+    a = X[:,0]
+    # Check for impact first, if no impact, no detection
+    if not np.any(a >= acc_thresh):
+        return None
+
+    kf=SimpleKF(); kf.reset()
+    for i in range(len(a)):
+        ir_med = np.nanmedian(X[i,1:5]) if np.any(~np.isnan(X[i,1:5])) else 1.0
+        vis_val = X[i,5] # current vision value
+
+        # Adjusted logic for Kalman filter's measurement update
+        if not np.isnan(vis_val) and vis_val < 0.5: # if vision indicates "not upright"
+            z = 0.2*(1-vis_val) + 0.2 # Lower position measurement based on vision
+            R = 0.05 # More trust in vision
+        else: # vision is NaN or indicates upright, rely on IR
+            z = ir_med
+            R = bestR
+        pos = kf.step(acc_u=-(a[i]-9.81), z=z, R=R)
+        if pos < 0.5: # If estimated position gets low enough, consider it a detection
+            return i
+    return None
+
+def find_detection_time_complementary(X, acc_thresh, alpha=0.7, ir_thresh=0.5, vision_thresh=0.5):
+    a = X[:,0]
+    if not np.any(a>=acc_thresh): return None
+    # For complementary, we need to find the *first* point where the fused value crosses the threshold
+    for i in range(len(a)):
+        if a[i] >= acc_thresh: # Only consider after impact threshold is crossed
+            ir_med = np.nanmedian(X[i,1:5]) if np.any(~np.isnan(X[i,1:5])) else 1.0
+            vis_val = X[i,5] # Use current vision value
+            # Handle NaN vision: if NaN, effectively it doesn't contribute
+            current_vis_contribution = (1-alpha)*(1.0 - vis_val) if not np.isnan(vis_val) else 0
+
+            fused = alpha*(1.0-ir_med) + current_vis_contribution
+            if fused > (1.0 - ir_thresh):
+                return i
+    return None
+
+# ---------- CLI ----------
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument('--data', type=str, default='FallAllD.pkl', help='Path to uploaded pickle (DataFrame or dict with X,y)')
+    p.add_argument('--out', type=str, default=OUT_DIR, help='Output directory')
+    p.add_argument('--mode', type=str, default='quick', choices=['quick','full'])
+    args = p.parse_args()
+    OUT_DIR = args.out
+    EVENTS_DIR = os.path.join(OUT_DIR, "events"); os.makedirs(EVENTS_DIR, exist_ok=True)
+    # run
+    res = run_pipeline(args.data, mode=args.mode)
+    print("Done. Results:\n", res)

@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>RMKCET IEEE Logo</title>
+</head>
+<body style="display: flex; justify-content: center; align-items: center; height: 100vh; background-color: #f0f0f0;">
+
+<svg width="600" height="600" viewBox="0 0 600 600" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <!-- Bronze Metallic Gradient for the Ring -->
+        <linearGradient id="bronzeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" style="stop-color:#8b5a2b;stop-opacity:1" />
+            <stop offset="20%" style="stop-color:#d4af37;stop-opacity:1" />
+            <stop offset="50%" style="stop-color:#f5deb3;stop-opacity:1" />
+            <stop offset="80%" style="stop-color:#b8860b;stop-opacity:1" />
+            <stop offset="100%" style="stop-color:#5d3a1a;stop-opacity:1" />
+        </linearGradient>
+
+        <!-- Paths for the circular text -->
+        <path id="topTextCircle" d="M 100,300 A 200,200 0 1,1 500,300" fill="none" />
+        <path id="bottomTextCircle" d="M 85,300 A 215,215 0 1,0 515,300" fill="none" />
+    </defs>
+
+    <!-- Outer Bronze Border -->
+    <circle cx="300" cy="300" r="280" fill="url(#bronzeGrad)" stroke="#5d3a1a" stroke-width="2" />
+    
+    <!-- Inner White Circle -->
+    <circle cx="300" cy="300" r="230" fill="white" stroke="#b8860b" stroke-width="3" />
+
+    <!-- Top Text: IEEE STUDENT COUNCIL -->
+    <text font-family="Arial, Helvetica, sans-serif" font-weight="900" font-size="42" fill="#001f3f">
+        <textPath href="#topTextCircle" startOffset="50%" text-anchor="middle">IEEE STUDENT COUNCIL</textPath>
+    </text>
+
+    <!-- Bottom Text: IEE STUDENT COUNCIL - RMKCET (Note: Typo 'IEE' kept from image) -->
+    <text font-family="Arial, Helvetica, sans-serif" font-weight="900" font-size="36" fill="#001f3f">
+        <textPath href="#bottomTextCircle" startOffset="50%" text-anchor="middle">IEE STUDENT COUNCIL - RMKCET</textPath>
+    </text>
+
+    <!-- The Shield -->
+    <path d="M 210,180 
+             C 210,160 250,150 300,180 
+             C 350,150 390,160 390,180 
+             L 405,350 
+             Q 300,430 195,350 Z" 
+          fill="#006400" stroke="#004000" stroke-width="2" />
+
+    <!-- Inner White Area of Shield -->
+    <path d="M 230,230 
+             C 260,190 340,190 370,230 
+             Q 400,300 370,350 
+             Q 300,390 230,350 
+             Q 200,300 230,230 Z" 
+          fill="white" />
+
+    <!-- Shield Text -->
+    <text x="300" y="215" font-family="Arial" font-weight="bold" font-size="32" fill="white" text-anchor="middle">R.M.K.C.E.T</text>
+
+    <!-- Simplified Icons (Representational) -->
+    <g stroke="#006400" stroke-width="2" fill="none">
+        <!-- Towers -->
+        <path d="M 240,310 L 255,245 L 270,310 M 245,290 L 265,290" />
+        <path d="M 280,300 L 295,255 L 310,300 M 285,285 L 305,285" />
+        <!-- Satellite/Dish -->
+        <circle cx="275" cy="340" r="12" />
+        <path d="M 275,340 L 275,315" />
+        <!-- Satellite (Top Right) -->
+        <rect x="345" y="250" width="25" height="15" rx="2" stroke-width="1" />
+        <path d="M 335,257 L 345,257 M 370,257 L 380,257" />
+        <!-- Gears -->
+        <circle cx="345" cy="340" r="22" fill="#006400" />
+        <circle cx="345" cy="340" r="8" fill="white" />
+    </g>
+
+    <!-- Bottom Banner Ribbon -->
+    <path d="M 190,440 L 230,420 L 370,420 L 410,440 L 390,480 L 300,465 L 210,480 Z" fill="#e8d4a2" stroke="#b8860b" />
+    <path d="M 190,440 L 170,460 L 210,480 Z" fill="#004000" /> <!-- Ribbon fold left -->
+    <path d="M 410,440 L 430,460 L 390,480 Z" fill="#004000" /> <!-- Ribbon fold right -->
+
+    <!-- Tamil Text on Banner -->
+    <text x="300" y="455" font-family="Arial, sans-serif" font-weight="bold" font-size="22" fill="#8b5a2b" text-anchor="middle">அறிவே ஆக்கம்</text>
+
+</svg>
+
+</body>
+</html>
