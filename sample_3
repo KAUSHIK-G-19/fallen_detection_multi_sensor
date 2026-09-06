@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+from sklearn.ensemble import RandomForestClassifier
 
 # Check for TensorFlow
 try:
@@ -22,14 +23,14 @@ except ImportError:
     TF_AVAILABLE = False
 
 # ================= CONFIGURATION =================
-INPUT_FILE_PATH = r"C:\Users\KAUSHIK G\Downloads\fall_detection 100.xlsx"
+INPUT_FILE_PATH = r"C:\Users\KAUSHIK G\OneDrive\Desktop\pd project\fall_detection_dataset.csv"
 OUTPUT_FILE_PATH = r"C:\Users\KAUSHIK G\OneDrive\Desktop\pd project\Fallall_output.xlsx"
 OUTPUT_DIR = os.path.dirname(OUTPUT_FILE_PATH)
 
 SR = 100
 WINDOW_SEC = 2.0
 STEP_SEC = 1.0
-NUM_EPOCHS = 1000
+NUM_EPOCHS = 100
 BATCH_SIZE = 64
 RANDOM_SEED = 42
 
@@ -72,25 +73,65 @@ def apply_kalman_filter(signal):
     return xhat
 
 
-def kalman_anomaly_detection(X_data, threshold=2.5):
+def kalman_anomaly_detection(X_data, X_train=None):
     """
-    Detects falls by looking for high variance in the Kalman-smoothed signals.
+    Enhanced anomaly detection with multi-feature analysis.
     """
     predictions = []
+    
+    # Calculate thresholds from training data
+    if X_train is not None:
+        train_acc_max_list = []
+        train_acc_std_list = []
+        train_med_acc_list = []
+        
+        for sample in X_train:
+            acc_mag = np.sqrt(np.sum(sample[:, :3] ** 2, axis=1))
+            train_acc_max_list.append(np.max(acc_mag))
+            train_acc_std_list.append(np.std(acc_mag))
+            train_med_acc_list.append(np.median(acc_mag))
+        
+        # Calculate percentile-based thresholds
+        acc_max_threshold = np.percentile(train_acc_max_list, 75) * 1.2
+        acc_std_threshold = np.percentile(train_acc_std_list, 75) * 1.3
+        med_acc_threshold = np.percentile(train_med_acc_list, 50)
+    else:
+        acc_max_threshold = 3.0
+        acc_std_threshold = 1.3
+        med_acc_threshold = 1.0
+    
     for sample in X_data:
-        # Calculate the magnitude of acceleration (SVM - Signal Vector Magnitude)
         acc_mag = np.sqrt(np.sum(sample[:, :3] ** 2, axis=1))
-        # If the smoothed acceleration exceeds the threshold, label as Fall
-        if np.max(acc_mag) > threshold:
+        gyro_mag = np.sqrt(np.sum(sample[:, 3:6] ** 2, axis=1))
+        
+        max_acc = np.max(acc_mag)
+        std_acc = np.std(acc_mag)
+        max_gyro = np.max(gyro_mag)
+        
+        # Detect fall with relaxed, multi-criteria approach
+        criteria_met = 0
+        
+        if max_acc > acc_max_threshold:
+            criteria_met += 1
+        if std_acc > acc_std_threshold and max_acc > med_acc_threshold:
+            criteria_met += 1
+        if max_gyro > 3.0:
+            criteria_met += 1
+        
+        if criteria_met >= 2 or max_acc > (acc_max_threshold * 1.5):
             predictions.append(1)
         else:
             predictions.append(0)
+    
     return np.array(predictions)
 
 
 # ================= DATA PROCESSING =================
 def load_and_clean_data(path):
-    df = pd.read_excel(path, engine='openpyxl')
+    if path.endswith('.csv'):
+        df = pd.read_csv(path)
+    else:
+        df = pd.read_excel(path, engine='openpyxl')
     df.columns = df.columns.str.strip().str.lower()
     required_cols = ['acc_x', 'acc_y', 'acc_z', 'gyro_x', 'gyro_y', 'gyro_z', 'heart_rate', 'fall_event']
     df.dropna(subset=required_cols, inplace=True)
@@ -161,7 +202,7 @@ def main():
     if TF_AVAILABLE:
         print("Training LSTM Model...")
         lstm_model = build_lstm_model((X_train.shape[1], X_train.shape[2]))
-        early_stop = EarlyStopping(monitor='val_loss', patience=7, restore_best_weights=True)
+        early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
 
         history = lstm_model.fit(
             X_train, y_train,
@@ -189,17 +230,49 @@ def main():
         plt.tight_layout()
         plt.show()
 
-    # --- MODEL 2: KALMAN ANOMALY DETECTOR ---
-    print("Running Kalman Anomaly Algorithm...")
-    y_pred_kalman = kalman_anomaly_detection(X_test)
+    # --- MODEL 2: KALMAN ANOMALY DETECTOR (IMPROVED) ---
+    print("Running Improved Kalman Anomaly Algorithm...")
+    y_pred_kalman = kalman_anomaly_detection(X_test, X_train_raw)
 
     acc_k = accuracy_score(y_test, y_pred_kalman)
     _, _, f1_k, _ = precision_recall_fscore_support(y_test, y_pred_kalman, average='binary', zero_division=0)
-    results.append({'Model': 'Kalman Algorithm', 'Accuracy': acc_k, 'F1_Score': f1_k})
+    results.append({'Model': 'Kalman Algorithm (Improved)', 'Accuracy': acc_k, 'F1_Score': f1_k})
+
+    # --- MODEL 3: RANDOM FOREST CLASSIFIER ---
+    print("Training Random Forest Classifier...")
+    
+    # Extract statistical features for Random Forest
+    def extract_features_rf(X_data):
+        features = []
+        for sample in X_data:
+            acc_mag = np.sqrt(np.sum(sample[:, :3] ** 2, axis=1))
+            gyro_mag = np.sqrt(np.sum(sample[:, 3:6] ** 2, axis=1))
+            hr = sample[:, 6]
+            
+            feature_row = [
+                np.max(acc_mag), np.mean(acc_mag), np.std(acc_mag),
+                np.max(gyro_mag), np.mean(gyro_mag), np.std(gyro_mag),
+                np.mean(hr), np.std(hr),
+                np.max(acc_mag) - np.min(acc_mag),
+                np.percentile(acc_mag, 75)
+            ]
+            features.append(feature_row)
+        return np.array(features)
+    
+    X_train_rf = extract_features_rf(X_train_raw)
+    X_test_rf = extract_features_rf(X_test_raw)
+    
+    rf_model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=RANDOM_SEED, min_samples_split=2)
+    rf_model.fit(X_train_rf, y_train)
+    
+    y_pred_rf = rf_model.predict(X_test_rf)
+    acc_rf = accuracy_score(y_test, y_pred_rf)
+    _, _, f1_rf, _ = precision_recall_fscore_support(y_test, y_pred_rf, average='binary', zero_division=0)
+    results.append({'Model': 'Random Forest', 'Accuracy': acc_rf, 'F1_Score': f1_rf})
 
     # --- SAVE RESULTS ---
     results_df = pd.DataFrame(results)
-    preds_df = pd.DataFrame({'True_Label': y_test, 'Kalman_Pred': y_pred_kalman})
+    preds_df = pd.DataFrame({'True_Label': y_test, 'Kalman_Pred': y_pred_kalman, 'RandomForest_Pred': y_pred_rf})
     if y_pred_lstm is not None:
         preds_df['LSTM_Pred'] = y_pred_lstm
 

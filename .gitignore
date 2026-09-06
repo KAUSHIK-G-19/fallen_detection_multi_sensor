@@ -18,3 +18,7 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Incident alert images
+alerts/*.jpg
+alerts/*.png
