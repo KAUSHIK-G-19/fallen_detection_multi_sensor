@@ -3,8 +3,10 @@ Spatiotemporal Decision Engine Module
 Implements a 4-stage finite state machine combining real-time vision pose geometry
 and wearable sensor dynamics to eliminate false alarms and confirm genuine falls.
 """
-import time
+import json
 import os
+import time
+
 import cv2
 
 
@@ -28,6 +30,7 @@ class FallDecisionEngine:
         self.impact_window = impact_window_sec
         self.alert_dir = alert_dir
         os.makedirs(self.alert_dir, exist_ok=True)
+        self.event_log_path = os.path.join(self.alert_dir, "fall_event_log.jsonl")
 
         self.current_state = self.STATE_NORMAL
         self.time_impact = 0.0
@@ -42,6 +45,15 @@ class FallDecisionEngine:
         # Physical constants
         self.G = 9.81
         self.ACC_IMPACT_THRESHOLD = 2.0 * self.G  # 19.6 m/s^2
+        self._log_event("system_initialized", {"alert_dir": self.alert_dir, "inactivity_timeout": self.inactivity_timeout})
+
+    def _log_event(self, event_type, payload):
+        try:
+            entry = {"timestamp": time.time(), "event": event_type, "payload": payload}
+            with open(self.event_log_path, "a", encoding="utf-8") as log_file:
+                log_file.write(json.dumps(entry, default=str) + "\n")
+        except Exception:
+            pass
 
     def update(self, vision_features, sensor_features, frame=None):
         """
@@ -60,12 +72,19 @@ class FallDecisionEngine:
         centroid_vy = vision_features.get('centroid_vy', 0.0)
 
         svm_acc = sensor_features.get('svm_acc', self.G)
-        max_impact = sensor_features.get('max_impact', self.G)
-        has_sensor_impact = sensor_features.get('has_impact', False)
-        is_freefall = sensor_features.get('is_freefall', False)
+        has_sensor_impact = bool(sensor_features.get('has_impact', False))
+        ir_dist = sensor_features.get('ir_distance', None)
+        tilt_ang = sensor_features.get('tilt_angle', 0.0)
+        sensor_prone = (ir_dist is not None and ir_dist < 0.35) or (tilt_ang > 65.0)
 
         trigger_alert = False
         emergency_snapshot_path = None
+        previous_state = self.current_state
+
+        posture_evidence = is_laying or aspect_ratio > 1.1 or torso_angle > 45.0 or sensor_prone
+        motion_evidence = (centroid_vy > 1.2) or (aspect_ratio > 0.8 and centroid_vy > 0.5) or (torso_angle > 30.0)
+        sensor_impact = has_sensor_impact or (svm_acc > self.ACC_IMPACT_THRESHOLD)
+        valid_impact_candidate = sensor_impact and (motion_evidence or posture_evidence)
 
         # -------------------------------------------------------------
         # STATE 0: NORMAL
@@ -73,10 +92,9 @@ class FallDecisionEngine:
         if self.current_state == self.STATE_NORMAL:
             self.fall_confidence = max(0.0, self.fall_confidence - 5.0)
 
-            # Impact trigger: High sensor acceleration spike OR sharp camera descent
+            # Enter a short observation window for impact-only events. Confirmation
+            # still requires posture or motion evidence in the following stages.
             vision_impact = (centroid_vy > 1.2 and aspect_ratio > 0.8)
-            sensor_impact = has_sensor_impact or (svm_acc > self.ACC_IMPACT_THRESHOLD)
-
             if sensor_impact or vision_impact:
                 self.current_state = self.STATE_IMPACT
                 self.time_impact = now
@@ -97,12 +115,12 @@ class FallDecisionEngine:
             self.fall_confidence = 60.0
 
             # Did posture collapse into lying position within the impact window?
-            if is_laying or aspect_ratio > 1.15 or torso_angle > 45.0:
+            if is_laying or aspect_ratio > 1.15 or torso_angle > 45.0 or sensor_prone:
                 self.current_state = self.STATE_COLLAPSE
                 self.time_collapse = now
                 self.fall_confidence = 75.0
 
-            # If impact happened but person remains standing upright -> False alarm, return to normal
+            # If impact happened but person remains upright -> False alarm, return to normal
             elif time_since_impact > self.impact_window:
                 self.current_state = self.STATE_NORMAL
                 self.fall_confidence = 10.0
@@ -152,6 +170,8 @@ class FallDecisionEngine:
                             self.snapshot_saved = True
                             print(f"[EMERGENCY ALERT] Fall incident snapshot saved to: {emergency_snapshot_path}")
 
+                        self._log_event("fall_alert", {"state": self.current_state, "confidence": self.fall_confidence, "snapshot_path": emergency_snapshot_path, "timestamp": now})
+
             else:
                 # Person stood up before timeout
                 self.current_state = self.STATE_NORMAL
@@ -169,15 +189,22 @@ class FallDecisionEngine:
                 self.fall_confidence = 0.0
                 self.snapshot_saved = False
 
+        if previous_state != self.current_state:
+            self._log_event("state_transition", {"from": previous_state, "to": self.current_state, "confidence": self.fall_confidence})
+
         return {
             'state': self.current_state,
             'confidence': float(self.fall_confidence),
             'trigger_alert': trigger_alert,
             'snapshot_path': emergency_snapshot_path,
-            'is_fall_active': (self.current_state == self.STATE_CONFIRMED)
+            'is_fall_active': (self.current_state == self.STATE_CONFIRMED),
+            'sensor_prone': sensor_prone,
+            'ir_distance': float(ir_dist) if ir_dist is not None else 1.65,
+            'tilt_angle': float(tilt_ang)
         }
 
     def reset(self):
         self.current_state = self.STATE_NORMAL
         self.fall_confidence = 0.0
         self.snapshot_saved = False
+        self._log_event("reset_state", {"state": self.current_state})

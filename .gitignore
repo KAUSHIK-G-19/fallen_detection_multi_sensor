@@ -22,3 +22,5 @@ Thumbs.db
 # Incident alert images
 alerts/*.jpg
 alerts/*.png
+
+alerts/*.jsonl

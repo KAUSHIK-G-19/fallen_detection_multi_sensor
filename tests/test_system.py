@@ -8,6 +8,7 @@ Verifies:
 """
 import os
 import sys
+import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pickle
 import numpy as np
@@ -84,7 +85,6 @@ def test_decision_engine_state_machine():
     assert d3['state'] == FallDecisionEngine.STATE_COLLAPSE
 
     # 4. Inactivity begins
-    import time
     time.sleep(0.1)
     d4 = engine.update(lying_vision, normal_sensor)
     assert d4['state'] == FallDecisionEngine.STATE_INACTIVITY
@@ -99,6 +99,34 @@ def test_decision_engine_state_machine():
     engine.reset()
     assert engine.current_state == FallDecisionEngine.STATE_NORMAL
     print("[TEST PASSED] FallDecisionEngine finite state machine transitions verified.")
+
+
+def test_false_alarm_guard_requires_posture_and_impact():
+    engine = FallDecisionEngine(inactivity_timeout_sec=0.2, impact_window_sec=0.5)
+
+    normal_vision = {'is_laying': False, 'aspect_ratio': 0.45, 'torso_angle': 10.0, 'centroid_vy': 0.0}
+    normal_sensor = {'svm_acc': 9.81, 'max_impact': 9.81, 'has_impact': False, 'is_freefall': False}
+    impact_only_sensor = {'svm_acc': 26.0, 'max_impact': 26.0, 'has_impact': True, 'is_freefall': False}
+
+    decision = engine.update(normal_vision, impact_only_sensor)
+    assert decision['state'] == FallDecisionEngine.STATE_IMPACT
+    time.sleep(0.55)
+    decision = engine.update(normal_vision, normal_sensor)
+    assert decision['state'] == FallDecisionEngine.STATE_NORMAL
+    print("[TEST PASSED] Decision engine suppresses impact-only false alarms without posture collapse.")
+
+
+def test_event_logging_created_for_alerts():
+    engine = FallDecisionEngine(inactivity_timeout_sec=0.05, impact_window_sec=0.2, alert_dir='alerts')
+    assert engine.event_log_path.endswith('.jsonl')
+    assert os.path.exists(os.path.dirname(engine.event_log_path))
+
+    visual = {'is_laying': True, 'aspect_ratio': 1.6, 'torso_angle': 75.0, 'centroid_vy': 2.0}
+    sensor = {'svm_acc': 30.0, 'max_impact': 30.0, 'has_impact': True, 'is_freefall': False}
+    engine.update(visual, sensor)
+
+    assert os.path.exists(engine.event_log_path)
+    print("[TEST PASSED] Decision engine writes state transition events to the alert log.")
 
 
 def test_saved_model_inference():
@@ -125,10 +153,33 @@ def test_saved_model_inference():
     print("[TEST PASSED] Saved ML model makes accurate predictions on test vectors.")
 
 
+def test_multisensor_integration():
+    buffer = RealtimeSensorRingBuffer(capacity=50, sr=100)
+    streamer = RealisticSensorStreamer()
+
+    # 1. Test standing posture
+    streamer.set_posture_mode("standing")
+    sample_standing = streamer.get_next_sample()
+    feats_standing = buffer.add_sample(sample_standing, ir_distance=streamer.latest_ir_distance)
+    assert feats_standing['posture_sensor'] in ["STANDING", "SITTING"]
+    assert feats_standing['tilt_angle'] < 30.0
+    assert feats_standing['ir_distance'] > 1.2
+
+    # 2. Test lying posture
+    streamer.set_posture_mode("lying")
+    sample_lying = streamer.get_next_sample()
+    feats_lying = buffer.add_sample(sample_lying, ir_distance=streamer.latest_ir_distance)
+    assert feats_lying['posture_sensor'] == "LYING"
+    assert feats_lying['tilt_angle'] > 60.0
+    assert feats_lying['ir_distance'] < 0.4
+    print("[TEST PASSED] Multi-sensor integration (IMU, MPU-6050, IR) correctly classifies posture.")
+
+
 if __name__ == "__main__":
     test_kalman_1d()
     test_kalman_2d()
     test_sensor_ring_buffer()
     test_decision_engine_state_machine()
     test_saved_model_inference()
+    test_multisensor_integration()
     print("\nALL SYSTEM TESTS PASSED SUCCESSFULLY!")

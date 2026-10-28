@@ -204,6 +204,31 @@ pip install numpy pandas opencv-python mediapipe tensorflow scikit-learn soundde
 
 ---
 
+## 🎓 5-Stage Modular Presentation Suite
+
+To present the progressive multi-sensor and computer vision hierarchy during project vivas, defenses, or evaluations, launch the unified presentation runner:
+
+```bash
+# Launch interactive presentation suite (press keys 1 to 5 to switch stages live):
+python presentation_demo.py
+
+# Or launch directly into any specific stage:
+python presentation_demo.py --stage 1    # Stage 1: Single IMU (Presence & Motion Detection)
+python presentation_demo.py --stage 2    # Stage 2: Dual Sensor IMU + MPU-6050 (Position & 3D Tilt Angle)
+python presentation_demo.py --stage 3    # Stage 3: Tri-Sensor IMU + MPU + IR (Position & Posture Classification)
+python presentation_demo.py --stage 4    # Stage 4: Camera Stick Figure (Vision-Only Fall Detection)
+python presentation_demo.py --stage 5    # Stage 5: Full Multimodal Late-Fusion (All Sensors + Vision + Alarm)
+```
+
+### Presentation Stage Hierarchy:
+1. **Stage 1 (Single IMU Sensor)**: Online Kalman-denoised acceleration, resultant $SVM_{\text{acc}}$, and dynamic motion magnitude to detect **Human Presence: Active vs. Stationary**.
+2. **Stage 2 (Two Sensors: IMU + MPU-6050)**: 6-DOF fusion calculating Pitch, Roll, and 3D Body Tilt Angle from vertical to determine **Human Position: Upright, Leaning, or Recumbent**.
+3. **Stage 3 (Three Sensors: IMU + MPU-6050 + IR Sensor)**: Combines tilt angle with IR floor distance / proximity clearance ($m$) to classify **Human Posture: Standing, Sitting, Bending, or Prone on Floor**.
+4. **Stage 4 (Camera Stick Figure / Skeleton Analysis)**: 33-point MediaPipe/OpenCV skeletal tracking, bounding box aspect ratio ($AR = W/H$), torso angle, and downward velocity ($V_y$) for **Vision-Only Fall Detection**.
+5. **Stage 5 (Full Multimodal Late-Fusion Integration)**: Integrates all 3 wearable sensors, camera stick figure pose, and live video stream into the 4-stage spatiotemporal finite state machine with audible siren and automated incident snapshots in `alerts/`.
+
+---
+
 ## 🚀 Running the Application
 
 ### Mode 1: Physical Webcam (Live Patient Monitoring)
@@ -222,10 +247,24 @@ python realtime_deploy.py --source synthetic
   - Press **`R`**: Reset status back to `NORMAL`.
   - Press **`Q`** or **`ESC`**: Quit the application.
 
-### Mode 3: Video File Analysis
-Process an existing recorded video stream:
+### Mode 3: Video File or URFD Image Sequence Analysis
+Process an existing recorded video stream or genuine URFD image sequence folder:
 ```bash
+# Run with video file:
 python realtime_deploy.py --source path/to/patient_video.mp4
+
+# Run with real URFD fall camera sequence:
+python realtime_deploy.py --source "C:\Users\KAUSHIK G\Downloads\urfd\UR_fall_detection_dataset_cam0_rgb\fall-01-cam0-rgb"
+```
+
+### Mode 4: Genuine Clinical FallAllD Sensor Streaming
+Stream real wearable IMU/MPU-6050 trials directly from the FallAllD dataset (Waist / Neck):
+```bash
+# Replay clinical FallAllD trials with synthetic animation or webcam:
+python realtime_deploy.py --source synthetic --dataset fallalld
+
+# Replay synchronized FallAllD sensor stream with real URFD video sequence:
+python realtime_deploy.py --source "C:\Users\KAUSHIK G\Downloads\urfd\UR_fall_detection_dataset_cam0_rgb\fall-01-cam0-rgb" --dataset fallalld
 ```
 
 ### Optional Command-Line Arguments

@@ -18,8 +18,8 @@ import numpy as np
 import cv2
 
 # Project modules
-from src.vision_tracker import VisionPoseTracker
-from src.sensor_streamer import RealtimeSensorRingBuffer, RealisticSensorStreamer
+from src.vision_tracker import VisionPoseTracker, ImageSequenceCapture
+from src.sensor_streamer import RealtimeSensorRingBuffer, RealisticSensorStreamer, SerialSensorStreamer, FallAllDStreamer
 from src.decision_engine import FallDecisionEngine
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -29,23 +29,35 @@ os.makedirs(ALERT_DIR, exist_ok=True)
 
 
 class RealtimeFallDetectorApp:
-    def __init__(self, source=0, enable_sound=True, inactivity_sec=1.8, record_path=None):
+    def __init__(self, source=0, enable_sound=True, inactivity_sec=1.8, record_path=None, serial_port=None, dataset=None):
         self.source = source
         self.enable_sound = enable_sound
         self.inactivity_sec = inactivity_sec
         self.record_path = record_path
+        self.serial_port = serial_port
+        self.dataset = dataset
         self.running = False
+        self.dependency_report = self._check_runtime_dependencies()
 
         print("\n" + "="*60)
         print("REAL-TIME MULTIMODAL FALL DETECTION SYSTEM")
         print("="*60)
+
+        if not self.dependency_report['cv2']:
+            print("[ERROR] OpenCV is not installed. This app cannot run without cv2.")
+            return
 
         # 1. Initialize Vision Tracker (MediaPipe Pose + 2D Kalman Filter)
         model_task_path = os.path.join(MODELS_DIR, "pose_landmarker_lite.task")
         self.vision_tracker = VisionPoseTracker(model_path=model_task_path)
 
         # 2. Initialize Sensor Streamer and Ring Buffer (100 Hz, 2.0s = 200 samples)
-        self.sensor_streamer = RealisticSensorStreamer()
+        if self.serial_port:
+            self.sensor_streamer = SerialSensorStreamer(port=self.serial_port)
+        elif self.dataset and str(self.dataset).lower() == "fallalld":
+            self.sensor_streamer = FallAllDStreamer()
+        else:
+            self.sensor_streamer = RealisticSensorStreamer()
         self.ring_buffer = RealtimeSensorRingBuffer(capacity=200, sr=100)
 
         # 3. Initialize Spatiotemporal Decision Engine
@@ -66,6 +78,28 @@ class RealtimeFallDetectorApp:
         self.synthetic_angle = 0.0
         self.synthetic_fall = False
         self.synthetic_fall_progress = 0
+
+    def _check_runtime_dependencies(self):
+        report = {'cv2': False, 'numpy': False, 'mediapipe': False}
+        try:
+            import cv2  # noqa: F401
+            report['cv2'] = True
+        except Exception:
+            print("[WARNING] OpenCV (cv2) not available. Install with 'pip install opencv-python'.")
+
+        try:
+            import numpy as np  # noqa: F401
+            report['numpy'] = True
+        except Exception:
+            print("[WARNING] NumPy not available.")
+
+        try:
+            import mediapipe  # noqa: F401
+            report['mediapipe'] = True
+        except Exception:
+            print("[INFO] MediaPipe not available; vision fallback mode will be used if needed.")
+
+        return report
 
     def _load_ml_model(self):
         scaler_path = os.path.join(MODELS_DIR, "scaler.pkl")
@@ -171,21 +205,34 @@ class RealtimeFallDetectorApp:
         return frame
 
     def run(self):
+        if not self.dependency_report.get('cv2', False):
+            print("[SYSTEM] Startup aborted: OpenCV dependency is missing. Install requirements and retry.")
+            return
+
         self.running = True
         is_synthetic = (str(self.source).lower() == "synthetic")
 
         cap = None
         if not is_synthetic:
-            try:
-                src_val = int(self.source)
-            except ValueError:
-                src_val = self.source
-            cap = cv2.VideoCapture(src_val)
-            if not cap.isOpened():
-                print(f"[WARNING] Unable to open video source '{self.source}'. Switching to SYNTHETIC mode.")
-                is_synthetic = True
+            if os.path.isdir(str(self.source)):
+                from src.vision_tracker import ImageSequenceCapture
+                cap = ImageSequenceCapture(self.source)
+                if not cap.isOpened():
+                    print(f"[WARNING] No valid image files in '{self.source}'. Switching to SYNTHETIC mode.")
+                    is_synthetic = True
+                else:
+                    print(f"[SYSTEM] Image sequence stream opened from: {self.source} ({len(cap.images)} frames)")
             else:
-                print(f"[SYSTEM] Live video stream opened from source: {self.source}")
+                try:
+                    src_val = int(self.source)
+                except ValueError:
+                    src_val = self.source
+                cap = cv2.VideoCapture(src_val)
+                if not cap.isOpened():
+                    print(f"[WARNING] Unable to open video source '{self.source}'. Switching to SYNTHETIC mode.")
+                    is_synthetic = True
+                else:
+                    print(f"[SYSTEM] Live video stream opened from source: {self.source}")
 
         writer = None
         prev_time = time.time()
@@ -210,7 +257,8 @@ class RealtimeFallDetectorApp:
 
                 # 2. Acquire Sensor Sample & Update Ring Buffer (100 Hz)
                 raw_sensor = self.sensor_streamer.get_next_sample()
-                sensor_feats = self.ring_buffer.add_sample(raw_sensor, timestamp=loop_start)
+                ir_dist = getattr(self.sensor_streamer, 'latest_ir_distance', 1.65)
+                sensor_feats = self.ring_buffer.add_sample(raw_sensor, timestamp=loop_start, ir_distance=ir_dist)
 
                 # 3. Vision Pose Tracking (MediaPipe + 2D Kalman Filter)
                 vision_feats, annotated_frame = self.vision_tracker.process_frame(frame, timestamp_sec=loop_start)
@@ -274,6 +322,18 @@ class RealtimeFallDetectorApp:
                     self.decision_engine.reset()
                     self.synthetic_fall = False
                     self.synthetic_fall_progress = 0
+                elif key == ord('1'):
+                    print("[EVENT] Posture set to STANDING")
+                    self.sensor_streamer.set_posture_mode('standing')
+                elif key == ord('2'):
+                    print("[EVENT] Posture set to SITTING")
+                    self.sensor_streamer.set_posture_mode('sitting')
+                elif key == ord('3'):
+                    print("[EVENT] Posture set to BENDING")
+                    self.sensor_streamer.set_posture_mode('bending')
+                elif key == ord('4'):
+                    print("[EVENT] Posture set to WALKING")
+                    self.sensor_streamer.set_posture_mode('walking')
 
         finally:
             self.running = False
@@ -321,10 +381,10 @@ class RealtimeFallDetectorApp:
         cv2.putText(out, f"FPS: {self.fps:.1f}", (w - 120, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         # 2. Side Telemetry Glass Panel
-        panel_w = 260
-        panel_h = 240
+        panel_w = 280
+        panel_h = 300
         panel_x = w - panel_w - 15
-        panel_y = 60
+        panel_y = 55
 
         # Semi-transparent dark overlay
         overlay = out.copy()
@@ -334,13 +394,16 @@ class RealtimeFallDetectorApp:
 
         # Telemetry Text
         lines = [
-            ("TELEMETRY", f"{self.latency_ms:.1f} ms"),
-            ("Posture:", vision_feats.get('posture', 'N/A')),
+            ("MULTIMODAL FUSION", f"{self.latency_ms:.1f} ms"),
+            ("Posture (Vis):", str(vision_feats.get('posture', 'N/A'))),
+            ("Posture (Sen):", str(sensor_feats.get('posture_sensor', 'STANDING'))),
             ("Aspect Ratio:", f"{vision_feats.get('aspect_ratio', 0.0):.2f}"),
             ("Torso Angle:", f"{vision_feats.get('torso_angle', 0.0):.0f} deg"),
+            ("MPU-6050 Tilt:", f"{sensor_feats.get('tilt_angle', 0.0):.0f} deg"),
+            ("IR Distance:", f"{sensor_feats.get('ir_distance', 1.65):.2f} m"),
+            ("IMU Motion:", str(sensor_feats.get('imu_activity', 'ACTIVE')[:15])),
             ("Accel SVM:", f"{sensor_feats.get('svm_acc', 9.81):.2f} m/s2 ({sensor_feats.get('svm_acc', 9.81)/9.81:.2f}g)"),
             ("Gyro Mag:", f"{sensor_feats.get('svm_gyro', 0.0):.1f} deg/s"),
-            ("Heart Rate:", f"{int(sensor_feats.get('heart_rate', 75))} BPM"),
             ("Alerts Fired:", str(self.alert_count))
         ]
 
@@ -383,6 +446,10 @@ def parse_args():
                         help="Post-fall inactivity confirmation timeout in seconds (default: 1.8)")
     parser.add_argument("--record", type=str, default=None,
                         help="Path to save output video (.mp4)")
+    parser.add_argument("--port", type=str, default=None,
+                        help="Optional serial port for physical Arduino/ESP32 sensor streaming (e.g., COM3)")
+    parser.add_argument("--dataset", type=str, default=None, choices=["fallalld", "synthetic"],
+                        help="Optional dataset stream source: 'fallalld' to stream genuine FallAllD clinical trials")
     return parser.parse_args()
 
 
@@ -392,6 +459,8 @@ if __name__ == "__main__":
         source=args.source,
         enable_sound=args.sound,
         inactivity_sec=args.inactivity,
-        record_path=args.record
+        record_path=args.record,
+        serial_port=args.port,
+        dataset=args.dataset
     )
     app.run()

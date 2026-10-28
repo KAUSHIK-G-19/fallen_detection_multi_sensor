@@ -240,3 +240,40 @@ class VisionPoseTracker:
             except Exception:
                 pass
             self.landmarker = None
+
+
+class ImageSequenceCapture:
+    """
+    Simulates a VideoCapture stream from an image directory (such as URFD PNG frame sequences).
+    """
+    def __init__(self, folder_path, fps=30.0):
+        import glob
+        self.folder_path = folder_path
+        self.fps = fps
+        self.images = sorted(
+            glob.glob(os.path.join(folder_path, '*.png')) +
+            glob.glob(os.path.join(folder_path, '*.jpg')) +
+            glob.glob(os.path.join(folder_path, '*.jpeg'))
+        )
+        self.idx = 0
+        self.is_opened = len(self.images) > 0
+
+    def isOpened(self):
+        return self.is_opened
+
+    def read(self):
+        if not self.images:
+            return False, None
+        img_path = self.images[self.idx]
+        self.idx = (self.idx + 1) % len(self.images)
+        frame = cv2.imread(img_path)
+        if frame is None:
+            return False, None
+        return True, frame
+
+    def set(self, prop, val):
+        if prop == cv2.CAP_PROP_POS_FRAMES:
+            self.idx = int(val) % max(1, len(self.images))
+
+    def release(self):
+        pass
